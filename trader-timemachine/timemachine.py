@@ -110,6 +110,63 @@ class TMError(Exception):
 
 # ---------------------------------------------------------------- time (copied from trader-alerts)
 
+# ---------------------------------------------------------------- market (US by default, NSE India)
+
+def _load_market():
+    """market.py sits next to this file: the same copy in every skill folder."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market.py")
+    spec = importlib.util.spec_from_file_location("trader_market", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MKT = _load_market()
+MARKET = "us"
+_US = {}
+_MARKET_GLOBALS = ("OPEN", "CLOSE", "EARLY", "NYSE_HOLIDAYS", "NYSE_EARLY_CLOSE", "CALENDAR_YEARS", "DEFAULTS",
+                   "OPEN_MIN", "CLOSE_MIN", "EARLY_MIN", "SESSION_BARS")
+
+
+def use_market(name):
+    """Switch this tool's clock, calendar and defaults to a market: "us" or "nse" (see market.py).
+    The NYSE_* names keep their names and hold the other exchange's calendar."""
+    global MARKET
+    g = globals()
+    p = MKT.profile(name)
+    if not _US:
+        for k in _MARKET_GLOBALS:
+            if k in g:
+                _US[k] = dict(g[k]) if isinstance(g[k], dict) else g[k]
+    for k, v in _US.items():
+        if isinstance(v, dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+    MARKET = name
+    if name == "us":
+        return
+    o, c = p["open"], p["close"]
+    o_min, c_min = o.hour * 60 + o.minute, c.hour * 60 + c.minute
+    new = {"OPEN": o, "CLOSE": c, "EARLY": c, "NYSE_HOLIDAYS": p["holidays"], "NYSE_EARLY_CLOSE": p["early_close"],
+           "CALENDAR_YEARS": p["calendar_years"], "OPEN_MIN": o_min, "CLOSE_MIN": c_min, "EARLY_MIN": c_min,
+           "SESSION_BARS": (c_min - o_min) // 5,
+           "DEFAULTS": dict({k: p[k] for k in ("no_entries_before", "no_entries_after", "flat_by")},
+                            **p.get("limits", {}))}
+    for k, v in new.items():
+        if k not in _US:
+            continue
+        if k == "DEFAULTS":
+            g[k].update({kk: vv for kk, vv in v.items() if kk in g[k]})
+        elif isinstance(_US[k], dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+
+
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
     d += datetime.timedelta(days=(6 - d.weekday()) % 7)
@@ -120,6 +177,8 @@ def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
+    if MARKET != "us":
+        return MKT.profile(MARKET)["utc_offset_hours"]
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -132,6 +191,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET != "us":
+        return local - datetime.timedelta(hours=MKT.profile(MARKET)["utc_offset_hours"])
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -187,7 +248,7 @@ def clock24(minutes):
 
 def chart_url(sym, host="query2"):
     return "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=60d&interval=5m" % (
-        host, urllib.parse.quote(sym.upper().replace(".", "-")))
+        host, MKT.yahoo_quoted(MARKET, sym))
 
 
 def _sleep(seconds):
@@ -531,7 +592,7 @@ def load_plan(a, now_utc):
 def normalize_plan(raw, src="flags"):
     """A plan dict (trader/plan.json shape) -> the checked plan the time machine runs."""
     sym = str(raw.get("symbol") or "").strip().upper()
-    if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", sym):
+    if not (re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", sym) if MARKET == "us" else MKT.ticker_ok(MARKET, sym)):
         raise TMError("the plan needs a ticker symbol, got %r" % raw.get("symbol"))
     side = str(raw.get("side") or "buy").lower()
     if side not in ("buy", "sell"):
@@ -569,15 +630,15 @@ def normalize_plan(raw, src="flags"):
     if k is None:
         raise TMError("the plan needs entry_time (the entry bar's close, e.g. 10:15 AM) or entry_bar")
     if not 0 <= k <= SESSION_BARS - 2:
-        raise TMError("the entry must close between 9:35 AM and 3:55 PM to leave bars to replay "
-                      "(got %s)" % clock12(OPEN_MIN + 5 * (k + 1)))
+        raise TMError("the entry must close between %s and %s to leave bars to replay "
+                      "(got %s)" % (clock12(OPEN_MIN + 5), clock12(CLOSE_MIN - 5), clock12(OPEN_MIN + 5 * (k + 1))))
     orng = raw.get("opening_range") or {}
     or_min = orng.get("minutes", 15) if isinstance(orng, dict) else 15
     try:
         or_min = int(or_min)
     except (TypeError, ValueError):
         raise TMError("opening_range.minutes must be a number")
-    if or_min < 5 or or_min % 5 or or_min >= 390:
+    if or_min < 5 or or_min % 5 or or_min >= CLOSE_MIN - OPEN_MIN:
         raise TMError("opening_range.minutes must be a multiple of 5 (got %s)" % or_min)
     risk = (entry - stop) if long else (stop - entry)
     return {
@@ -624,7 +685,7 @@ def resolve_rule(plan, entry_day):
 # ---------------------------------------------------------------- the run
 
 def _until12(mc):
-    t = mc.get("until") or "16:00"
+    t = mc.get("until") or clock24(CLOSE_MIN)
     return clock12(int(t[:2]) * 60 + int(t[3:]))
 
 
@@ -686,8 +747,10 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
     msym = str(meta.get("symbol") or "").upper()
-    if msym and msym != sym.replace(".", "-"):
+    if msym and not MKT.same_symbol(MARKET, msym, sym):
         raise TMError("the data is for %s but the plan is for %s" % (msym, sym))
+    if msym and MARKET != "us":
+        msym = MKT.from_yahoo(MARKET, msym)
     gran = meta.get("dataGranularity")
     if gran and gran != "5m":
         raise TMError("the data has %s bars; the time machine needs 5-minute bars" % gran)
@@ -740,7 +803,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
         "data": {"symbol": msym or sym, "interval": "5m", "range": "60d",
-                 "last_bar": "%s %s ET" % (last_bar["date"], last_bar["start"]),
+                 "last_bar": "%s %s %s" % (last_bar["date"], last_bar["start"], MKT.profile(MARKET)["tz"]),
                  "dropped": dropped, "short_sessions_left_out": short},
         "plan": plan_out,
         "mc": mc,
@@ -909,7 +972,7 @@ def cmd_chart(a):
     return 0
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(description="Time Machine: replay a planned day trade (trader-timemachine).")
     sub = ap.add_subparsers(dest="cmd")
 
@@ -950,6 +1013,16 @@ def main(argv=None):
     except TMError as e:
         print("timemachine.py: %s" % e, file=sys.stderr)
         return 1
+
+
+def main(argv=None):
+    try:
+        use_market(MKT.detect())
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
+    with MKT.output(MARKET):
+        return _main(argv)
 
 
 if __name__ == "__main__":

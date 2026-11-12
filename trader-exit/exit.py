@@ -99,6 +99,63 @@ class PlanError(Exception):
 
 # ---------------------------------------------------------------- time
 
+# ---------------------------------------------------------------- market (US by default, NSE India)
+
+def _load_market():
+    """market.py sits next to this file: the same copy in every skill folder."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market.py")
+    spec = importlib.util.spec_from_file_location("trader_market", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MKT = _load_market()
+MARKET = "us"
+_US = {}
+_MARKET_GLOBALS = ("OPEN", "CLOSE", "EARLY", "NYSE_HOLIDAYS", "NYSE_EARLY_CLOSE", "CALENDAR_YEARS", "DEFAULTS",
+                   "OPEN_MIN", "CLOSE_MIN", "EARLY_MIN", "SESSION_BARS")
+
+
+def use_market(name):
+    """Switch this tool's clock, calendar and defaults to a market: "us" or "nse" (see market.py).
+    The NYSE_* names keep their names and hold the other exchange's calendar."""
+    global MARKET
+    g = globals()
+    p = MKT.profile(name)
+    if not _US:
+        for k in _MARKET_GLOBALS:
+            if k in g:
+                _US[k] = dict(g[k]) if isinstance(g[k], dict) else g[k]
+    for k, v in _US.items():
+        if isinstance(v, dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+    MARKET = name
+    if name == "us":
+        return
+    o, c = p["open"], p["close"]
+    o_min, c_min = o.hour * 60 + o.minute, c.hour * 60 + c.minute
+    new = {"OPEN": o, "CLOSE": c, "EARLY": c, "NYSE_HOLIDAYS": p["holidays"], "NYSE_EARLY_CLOSE": p["early_close"],
+           "CALENDAR_YEARS": p["calendar_years"], "OPEN_MIN": o_min, "CLOSE_MIN": c_min, "EARLY_MIN": c_min,
+           "SESSION_BARS": (c_min - o_min) // 5,
+           "DEFAULTS": dict({k: p[k] for k in ("no_entries_before", "no_entries_after", "flat_by")},
+                            **p.get("limits", {}))}
+    for k, v in new.items():
+        if k not in _US:
+            continue
+        if k == "DEFAULTS":
+            g[k].update({kk: vv for kk, vv in v.items() if kk in g[k]})
+        elif isinstance(_US[k], dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+
+
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
     d += datetime.timedelta(days=(6 - d.weekday()) % 7)
@@ -107,6 +164,8 @@ def _nth_sunday(year, month, n):
 
 def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
+    if MARKET != "us":
+        return MKT.profile(MARKET)["utc_offset_hours"]
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -119,6 +178,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET != "us":
+        return local - datetime.timedelta(hours=MKT.profile(MARKET)["utc_offset_hours"])
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -141,6 +202,8 @@ def parse_now(text):
     t = text.strip()
     if t.upper().endswith(" ET"):
         t = t[:-3].strip()
+    elif t.upper().endswith(" IST"):
+        t = t[:-4].strip()
     if re.match(r"^\d{1,2}:\d{2}$", t):
         t = "%s %s" % (to_eastern(utc_now()).date().isoformat(), t.zfill(5))
     t = t.replace("Z", "+00:00")
@@ -391,7 +454,7 @@ def read_text(path):
 
 
 def load_chart(sym, interval, day, offline=None):
-    ysym = sym.upper().replace(".", "-")
+    ysym = MKT.yahoo_symbol(MARKET, sym)
     if offline:
         path = offline
         if os.path.isdir(offline):
@@ -409,7 +472,7 @@ def load_chart(sym, interval, day, offline=None):
         rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
         if interval == "1m" and back > 6:
             raise PlanError("Yahoo keeps 1-minute bars for about a week")
-        text = yahoo_get("/v8/finance/chart/%s?range=%s&interval=%s" % (ysym, rng, interval))
+        text = yahoo_get("/v8/finance/chart/%s?range=%s&interval=%s" % (MKT.yahoo_quoted(MARKET, sym), rng, interval))
     try:
         data = json.loads(text)
         res = data["chart"]["result"]
@@ -691,7 +754,7 @@ def cmd_show(a):
     return 0
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(description="Exit Planner (trader-exit): the stop and target before the entry.")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("plan", help="set the stop and target")
@@ -729,6 +792,16 @@ def main(argv=None):
     except PlanError as e:
         print("exit.py: %s" % e, file=sys.stderr)
         return 1
+
+
+def main(argv=None):
+    try:
+        use_market(MKT.detect())
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
+    with MKT.output(MARKET):
+        return _main(argv)
 
 
 if __name__ == "__main__":

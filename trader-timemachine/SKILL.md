@@ -156,6 +156,14 @@ and never calls a result a sure thing. It never prints a P&L or a profit.
 It never uses a bar that has not closed yet, and never mixes today's bars
 into the pool.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. A full session is 75 five-minute bars and the replays run to 15:30 unless --until says otherwise.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

@@ -94,6 +94,63 @@ class NewsError(Exception):
 
 # ---------------------------------------------------------------- time
 
+# ---------------------------------------------------------------- market (US by default, NSE India)
+
+def _load_market():
+    """market.py sits next to this file: the same copy in every skill folder."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market.py")
+    spec = importlib.util.spec_from_file_location("trader_market", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MKT = _load_market()
+MARKET = "us"
+_US = {}
+_MARKET_GLOBALS = ("OPEN", "CLOSE", "EARLY", "NYSE_HOLIDAYS", "NYSE_EARLY_CLOSE", "CALENDAR_YEARS", "DEFAULTS",
+                   "OPEN_MIN", "CLOSE_MIN", "EARLY_MIN", "SESSION_BARS")
+
+
+def use_market(name):
+    """Switch this tool's clock, calendar and defaults to a market: "us" or "nse" (see market.py).
+    The NYSE_* names keep their names and hold the other exchange's calendar."""
+    global MARKET
+    g = globals()
+    p = MKT.profile(name)
+    if not _US:
+        for k in _MARKET_GLOBALS:
+            if k in g:
+                _US[k] = dict(g[k]) if isinstance(g[k], dict) else g[k]
+    for k, v in _US.items():
+        if isinstance(v, dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+    MARKET = name
+    if name == "us":
+        return
+    o, c = p["open"], p["close"]
+    o_min, c_min = o.hour * 60 + o.minute, c.hour * 60 + c.minute
+    new = {"OPEN": o, "CLOSE": c, "EARLY": c, "NYSE_HOLIDAYS": p["holidays"], "NYSE_EARLY_CLOSE": p["early_close"],
+           "CALENDAR_YEARS": p["calendar_years"], "OPEN_MIN": o_min, "CLOSE_MIN": c_min, "EARLY_MIN": c_min,
+           "SESSION_BARS": (c_min - o_min) // 5,
+           "DEFAULTS": dict({k: p[k] for k in ("no_entries_before", "no_entries_after", "flat_by")},
+                            **p.get("limits", {}))}
+    for k, v in new.items():
+        if k not in _US:
+            continue
+        if k == "DEFAULTS":
+            g[k].update({kk: vv for kk, vv in v.items() if kk in g[k]})
+        elif isinstance(_US[k], dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+
+
 def _nth_sunday(year, month, n):
     d = _dt.date(year, month, 1)
     d += _dt.timedelta(days=(6 - d.weekday()) % 7)
@@ -102,6 +159,8 @@ def _nth_sunday(year, month, n):
 
 def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
+    if MARKET != "us":
+        return MKT.profile(MARKET)["utc_offset_hours"]
     y = utc.year
     start = _dt.datetime.combine(_nth_sunday(y, 3, 2), _dt.time(7, 0))   # 2:00 EST
     end = _dt.datetime.combine(_nth_sunday(y, 11, 1), _dt.time(6, 0))    # 2:00 EDT
@@ -192,7 +251,13 @@ class Fetcher(object):
 
 
 def yahoo_symbol(ticker):
-    return ticker.upper().replace(".", "-")
+    """The ticker as Yahoo wants it in a URL: BRK.B -> BRK-B, and on the NSE M&M -> M%26M.NS."""
+    return MKT.yahoo_quoted(MARKET, ticker)
+
+
+def headlines_url(ticker):
+    url = YAHOO % yahoo_symbol(ticker)
+    return url if MARKET == "us" else url.replace("region=US&lang=en-US", "region=IN&lang=en-IN")
 
 
 def cik_map(fetcher, state):
@@ -383,7 +448,7 @@ def collect(fetcher, watch, state, sec=True, forms=("8-K",), count=10, errors=No
     items = []
     for t in sorted(watch):
         try:
-            items += parse_rss(fetcher.get(YAHOO % yahoo_symbol(t), "yahoo-%s.xml" % t), t)
+            items += parse_rss(fetcher.get(headlines_url(t), "yahoo-%s.xml" % t), t)
         except NewsError as exc:
             errors.append("headlines for %s: %s" % (t, exc))
     if sec:
@@ -478,7 +543,7 @@ def _json_ready(items):
     return out
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--tickers", nargs="*", help="default: watchlist + plan + portfolio")
     ap.add_argument("--portfolio", default="trader/portfolio.json")
@@ -514,6 +579,9 @@ def main(argv=None):
     errors = []
     ua = sec_user_agent(args.user_agent, args.config)
     sec = not args.no_sec
+    if sec and MARKET != "us":
+        errors.append("SEC filings are US only: on the NSE this shows Yahoo headlines and the day's move")
+        sec = False
     if sec and not ua and not args.offline:
         errors.append("SEC filings skipped: set sec_user_agent in trader/config.json or "
                       "SEC_USER_AGENT (\"Your Name you@example.com\") to include them")
@@ -540,6 +608,16 @@ def main(argv=None):
             json.dump(state, fh, indent=2)
             fh.write("\n")
     return 0 if any(i["new"] for i in shown) else 1
+
+
+def main(argv=None):
+    try:
+        use_market(MKT.detect())
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
+    with MKT.output(MARKET):
+        return _main(argv)
 
 
 if __name__ == "__main__":

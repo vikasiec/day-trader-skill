@@ -61,6 +61,63 @@ class TicketError(Exception):
 
 # ---------------------------------------------------------------- time (New York, no tz files)
 
+# ---------------------------------------------------------------- market (US by default, NSE India)
+
+def _load_market():
+    """market.py sits next to this file: the same copy in every skill folder."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market.py")
+    spec = importlib.util.spec_from_file_location("trader_market", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MKT = _load_market()
+MARKET = "us"
+_US = {}
+_MARKET_GLOBALS = ("OPEN", "CLOSE", "EARLY", "NYSE_HOLIDAYS", "NYSE_EARLY_CLOSE", "CALENDAR_YEARS", "DEFAULTS",
+                   "OPEN_MIN", "CLOSE_MIN", "EARLY_MIN", "SESSION_BARS")
+
+
+def use_market(name):
+    """Switch this tool's clock, calendar and defaults to a market: "us" or "nse" (see market.py).
+    The NYSE_* names keep their names and hold the other exchange's calendar."""
+    global MARKET
+    g = globals()
+    p = MKT.profile(name)
+    if not _US:
+        for k in _MARKET_GLOBALS:
+            if k in g:
+                _US[k] = dict(g[k]) if isinstance(g[k], dict) else g[k]
+    for k, v in _US.items():
+        if isinstance(v, dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+    MARKET = name
+    if name == "us":
+        return
+    o, c = p["open"], p["close"]
+    o_min, c_min = o.hour * 60 + o.minute, c.hour * 60 + c.minute
+    new = {"OPEN": o, "CLOSE": c, "EARLY": c, "NYSE_HOLIDAYS": p["holidays"], "NYSE_EARLY_CLOSE": p["early_close"],
+           "CALENDAR_YEARS": p["calendar_years"], "OPEN_MIN": o_min, "CLOSE_MIN": c_min, "EARLY_MIN": c_min,
+           "SESSION_BARS": (c_min - o_min) // 5,
+           "DEFAULTS": dict({k: p[k] for k in ("no_entries_before", "no_entries_after", "flat_by")},
+                            **p.get("limits", {}))}
+    for k, v in new.items():
+        if k not in _US:
+            continue
+        if k == "DEFAULTS":
+            g[k].update({kk: vv for kk, vv in v.items() if kk in g[k]})
+        elif isinstance(_US[k], dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+
+
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
     d += datetime.timedelta(days=(6 - d.weekday()) % 7)
@@ -71,6 +128,8 @@ def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
+    if MARKET != "us":
+        return MKT.profile(MARKET)["utc_offset_hours"]
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -83,6 +142,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET != "us":
+        return local - datetime.timedelta(hours=MKT.profile(MARKET)["utc_offset_hours"])
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -107,7 +168,14 @@ def parse_now(text):
 def ny_iso(now_utc):
     """naive UTC -> "2026-10-19T10:15:00-04:00" (New York wall clock with its offset)."""
     off = eastern_offset(now_utc)
-    return "%s%+03d:00" % (to_eastern(now_utc).replace(microsecond=0).isoformat(), off)
+    mins = int(round(abs(off) * 60))
+    return "%s%s%02d:%02d" % (to_eastern(now_utc).replace(microsecond=0).isoformat(), "-" if off < 0 else "+",
+                              mins // 60, mins % 60)
+
+
+def broker_of(cfg):
+    """alpaca (the US default), ibkr, or paper: a local paper ledger, the default on the NSE."""
+    return str(cfg.get("broker") or ("alpaca" if MARKET == "us" else MKT.profile(MARKET)["limits"]["broker"])).lower()
 
 
 # ---------------------------------------------------------------- files
@@ -351,10 +419,11 @@ def kind_of(order, rv):
 
 def render(order, idx, total, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
-    paper = cfg.get("paper", True)
+    broker = broker_of(cfg)
+    paper = cfg.get("paper", True) or broker == "paper"
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, {"ibkr": "Interactive Brokers",
+                                                            "paper": "local paper ledger"}.get(broker, "Alpaca"))]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -365,6 +434,10 @@ def render(order, idx, total, cfg, risk, state, today):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+    elif broker == "paper":
+        lines.append("  A paper trade: it is written to trader/portfolio.json on this computer and goes to no")
+        lines.append("  broker. A stop-loss or a take-profit rests nowhere: trader-alerts rings when the price")
+        lines.append("  gets there, and you record the exit yourself.")
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -374,7 +447,7 @@ def render(order, idx, total, cfg, risk, state, today):
             lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
-        if broker != "ibkr":
+        if broker not in ("ibkr", "paper"):
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
     return "\n".join(lines), ready
 
@@ -384,7 +457,7 @@ def ticket_json(order, idx, cfg, risk, state, today):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": broker_of(cfg), "tool": None if broker_of(cfg) == "paper" else "place_stock_order",
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -512,12 +585,16 @@ def cmd_approve(a):
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order), "status": "approved", "reply": a.reply,
-           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+           "paper": bool(cfg.get("paper", True)) or broker_of(cfg) == "paper", "broker": broker_of(cfg)}
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    if broker_of(cfg) == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+    elif broker_of(cfg) == "paper":
+        print("Paper ledger: no order is sent anywhere. Look up the live price, then record the paper fill:")
+        print("  ticket.py result --index %d --status placed --filled-qty %s --filled-price PRICE"
+              % (a.index, order.get("qty") or "QTY"))
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
@@ -602,7 +679,7 @@ def cmd_flatten(a):
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
+        or cfg.get("flat_by") or ("15:55" if MARKET == "us" else MKT.profile(MARKET)["flat_by"])
     order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
              "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
              % (flat_by, sym, source)}
@@ -622,6 +699,9 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
+    if broker_of(cfg) == "paper":
+        print("  3. Paper ledger: record the exit at the live price with ticket.py result --filled-price PRICE.")
+        return 0
     print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
     print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
     print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
@@ -646,7 +726,7 @@ def cmd_log(a):
     return 0
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(description="Order tickets and your yes (trader-broker). Never places orders.")
     sub = ap.add_subparsers(dest="cmd")
 
@@ -714,6 +794,16 @@ def main(argv=None):
     except TicketError as e:
         print("ticket.py: %s" % e, file=sys.stderr)
         return 1
+
+
+def main(argv=None):
+    try:
+        use_market(MKT.detect())
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
+    with MKT.output(MARKET):
+        return _main(argv)
 
 
 if __name__ == "__main__":

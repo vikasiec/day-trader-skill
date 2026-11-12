@@ -110,6 +110,63 @@ class EntryError(Exception):
 
 # ---------------------------------------------------------------- time
 
+# ---------------------------------------------------------------- market (US by default, NSE India)
+
+def _load_market():
+    """market.py sits next to this file: the same copy in every skill folder."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market.py")
+    spec = importlib.util.spec_from_file_location("trader_market", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MKT = _load_market()
+MARKET = "us"
+_US = {}
+_MARKET_GLOBALS = ("OPEN", "CLOSE", "EARLY", "NYSE_HOLIDAYS", "NYSE_EARLY_CLOSE", "CALENDAR_YEARS", "DEFAULTS",
+                   "OPEN_MIN", "CLOSE_MIN", "EARLY_MIN", "SESSION_BARS")
+
+
+def use_market(name):
+    """Switch this tool's clock, calendar and defaults to a market: "us" or "nse" (see market.py).
+    The NYSE_* names keep their names and hold the other exchange's calendar."""
+    global MARKET
+    g = globals()
+    p = MKT.profile(name)
+    if not _US:
+        for k in _MARKET_GLOBALS:
+            if k in g:
+                _US[k] = dict(g[k]) if isinstance(g[k], dict) else g[k]
+    for k, v in _US.items():
+        if isinstance(v, dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+    MARKET = name
+    if name == "us":
+        return
+    o, c = p["open"], p["close"]
+    o_min, c_min = o.hour * 60 + o.minute, c.hour * 60 + c.minute
+    new = {"OPEN": o, "CLOSE": c, "EARLY": c, "NYSE_HOLIDAYS": p["holidays"], "NYSE_EARLY_CLOSE": p["early_close"],
+           "CALENDAR_YEARS": p["calendar_years"], "OPEN_MIN": o_min, "CLOSE_MIN": c_min, "EARLY_MIN": c_min,
+           "SESSION_BARS": (c_min - o_min) // 5,
+           "DEFAULTS": dict({k: p[k] for k in ("no_entries_before", "no_entries_after", "flat_by")},
+                            **p.get("limits", {}))}
+    for k, v in new.items():
+        if k not in _US:
+            continue
+        if k == "DEFAULTS":
+            g[k].update({kk: vv for kk, vv in v.items() if kk in g[k]})
+        elif isinstance(_US[k], dict):
+            g[k].clear()
+            g[k].update(v)
+        else:
+            g[k] = v
+
+
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
     d += datetime.timedelta(days=(6 - d.weekday()) % 7)
@@ -120,6 +177,8 @@ def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
+    if MARKET != "us":
+        return MKT.profile(MARKET)["utc_offset_hours"]
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -132,6 +191,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET != "us":
+        return local - datetime.timedelta(hours=MKT.profile(MARKET)["utc_offset_hours"])
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -164,6 +225,8 @@ def parse_now(text):
     t = text.strip()
     if t.upper().endswith(" ET"):
         t = t[:-3].strip()
+    elif t.upper().endswith(" IST"):
+        t = t[:-4].strip()
     if re.match(r"^\d{1,2}:\d{2}$", t):
         t = "%s %s" % (to_eastern(utc_now()).date().isoformat(), t.zfill(5))
     t = t.replace("Z", "+00:00")
@@ -220,7 +283,7 @@ def next_open(d):
     nd = d + datetime.timedelta(days=1)
     for _ in range(15):
         if session(nd):
-            return "%s 09:30" % nd.isoformat()
+            return "%s %s" % (nd.isoformat(), hm(OPEN))
         nd += datetime.timedelta(days=1)
     return None
 
@@ -228,11 +291,11 @@ def next_open(d):
 # ---------------------------------------------------------------- Yahoo
 
 def yahoo_symbol(sym):
-    return sym.upper().replace(".", "-")
+    return MKT.yahoo_symbol(MARKET, sym)
 
 
 def chart_path(sym, rng, interval):
-    return "/v8/finance/chart/%s?range=%s&interval=%s" % (yahoo_symbol(sym), rng, interval)
+    return "/v8/finance/chart/%s?range=%s&interval=%s" % (MKT.yahoo_quoted(MARKET, sym), rng, interval)
 
 
 def chart_range(day, today, interval):
@@ -366,6 +429,8 @@ def get_chart(sym, interval, day=None, offline=None, today=None):
     ch = parse_chart(text, sym)
     if ch["symbol"] != yahoo_symbol(sym):
         raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
+    if MARKET != "us":
+        ch["symbol"] = MKT.from_yahoo(MARKET, ch["symbol"])     # RELIANCE.NS -> RELIANCE in everything we write
     gran = ch["meta"].get("dataGranularity")
     if gran and gran != interval:
         raise EntryError("%s has %s bars, not %s: use --interval %s" % (sym, gran, interval, gran))
@@ -475,7 +540,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res["bars_closed"] = len(bars)
 
     if local < open_dt:
-        res.update(phase="pre-open", reason="the NYSE opens at 9:30%s" % (
+        res.update(phase="pre-open", reason="the NYSE opens at %s%s" % (short(OPEN),
             " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
         return res
 
@@ -772,7 +837,7 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
         else:
             nxt = open_dt + datetime.timedelta(seconds=(cur_slot + 1) * step + GRACE)
             wait = (nxt - local).total_seconds()
-        cutoff = datetime.datetime.combine(day, parse_hhmm(res.get("no_entries_after") or "15:30", "cutoff"))
+        cutoff = datetime.datetime.combine(day, parse_hhmm(res.get("no_entries_after") or DEFAULTS["no_entries_after"], "cutoff"))
         for stop_at in (until, cutoff, close_dt):
             if stop_at and stop_at > local:
                 wait = min(wait, (stop_at - local).total_seconds())
@@ -911,7 +976,7 @@ def cmd_watchlist(a):
     return 0 if any(r and r["status"] == "triggered" for _, r, _ in rows) else 1
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(description="Entry Timer (trader-entry): watches a setup bar by bar.")
     sub = ap.add_subparsers(dest="cmd")
 
@@ -954,6 +1019,16 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("entry.py: stopped.", file=sys.stderr)
         return 1
+
+
+def main(argv=None):
+    try:
+        use_market(MKT.detect())
+    except ValueError as e:
+        print("%s: %s" % (os.path.basename(__file__), e), file=sys.stderr)
+        return 1
+    with MKT.output(MARKET):
+        return _main(argv)
 
 
 if __name__ == "__main__":

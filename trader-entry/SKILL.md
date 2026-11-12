@@ -132,6 +132,14 @@ is `/trader-exit`), never moves the level after the fact, and never counts a
 bar that has not closed. It never runs `/trader-broker` from a background
 watch: nobody is there to say yes.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. No entries before 09:30 or after 15:00 unless the config says otherwise; the 15-minute opening range is 09:15 to 09:30.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

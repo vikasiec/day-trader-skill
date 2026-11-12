@@ -191,6 +191,14 @@ oversold bounce).
 It never places, sizes or checks an order, never says which stock to buy,
 never calls data real time, and never promises that a setup works.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. `scan.py universe` writes the Nifty 500 (or a built-in large-cap list when NSE's archive does not answer); the price floor is Rs 50 and the daily volume floor 500,000 shares.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

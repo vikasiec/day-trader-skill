@@ -120,6 +120,14 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 It never places an order, never sizes a position, never widens a stop to
 make a plan pass, and never calls a stop a guarantee.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. The default flat-by is 15:10, ahead of the broker's intraday square-off. Prices are to the paisa; a real order is rounded to the NSE tick by the broker.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

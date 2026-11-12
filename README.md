@@ -152,6 +152,69 @@ for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.
 
+## NSE India mode
+
+The pack is built for US stocks. This fork adds a second market, the NSE cash
+market, without changing anything for US use. Turn it on in
+`trader/config.json`:
+
+```json
+{
+  "market": "nse",
+  "budget": 100000
+}
+```
+
+or set `TRADER_MARKET=nse` in the environment. With no setting the market is
+`us` and every tool behaves exactly as upstream.
+
+What changes on the NSE:
+
+| | US (default) | NSE |
+| --- | --- | --- |
+| clock | New York, with daylight saving | India Standard Time, UTC+5:30 |
+| session | 9:30 to 16:00, some 13:00 early closes | 09:15 to 15:30, no early closes |
+| holidays | NYSE 2026 and 2027 | NSE capital market 2026 (16 weekday closures) |
+| symbols | TSLA, BRK.B | RELIANCE, M&M, BAJAJ-AUTO (Yahoo is asked for RELIANCE.NS) |
+| money | $ | Rs |
+| entry window | 09:45 to 15:30 | 09:30 to 15:00 |
+| flat by | 15:55 | 15:10, ahead of the broker's intraday square-off |
+| limits, no config | $50 a trade, $150 a day, orders $5 to $4,000 | Rs 500 a trade, Rs 1,500 a day, orders Rs 100 to Rs 50,000 |
+| universe | about 5,900 stocks from Nasdaq Trader | the Nifty 500, from NSE's archive |
+| broker | Alpaca or Interactive Brokers | a local paper ledger: no order leaves your computer |
+
+The config keys keep their `_usd` names (`max_loss_per_trade_usd` and so on);
+on the NSE the amounts are rupees.
+
+What works: `/trader-scanner`, `/trader-news` (Yahoo headlines and the day's
+move), `/trader-entry`, `/trader-exit`, `/trader-timemachine` (75 five-minute
+bars a session), `/trader-budget`, `/trader-risk`, `/trader-broker` (paper
+ledger) and `/trader-alerts` (Yahoo quotes).
+
+What does not, and what to know:
+
+- `/trader-analyst` and `/trader-pelosi` read US filings only.
+- No live orders. `/trader-broker` shows the ticket, records your yes and
+  writes the paper fill you give it to `trader/portfolio.json`. A stop-loss or
+  a take-profit rests nowhere: `/trader-alerts` rings and you record the exit.
+- Charges are not in the max-loss arithmetic: brokerage, STT, exchange and SEBI
+  fees, GST and stamp duty come on top.
+- Prices are planned to the paisa. NSE tick sizes depend on the share price,
+  so a real order is rounded by your broker.
+- The holiday list is 2026 only. NSE publishes the next year's list each
+  December: add it to `NSE_HOLIDAYS` and `CALENDAR_YEARS` in `market.py` and
+  copy the file over the other eight (`tests/test_market.py` checks they
+  match). The one-hour Muhurat session on Diwali is not treated as a session.
+- If NSE's archive does not answer, `scan.py universe` writes a built-in list
+  of large caps and says so. Or keep your own list in `trader/universe.txt`.
+- Yahoo's NSE bars are free and unofficial and may run behind the exchange.
+  Every tool prints the time of the data it used: check it against your broker
+  before you act on a trigger.
+
+`market.py` holds the profile; the same copy sits in each of the nine skill
+folders that need it. The NSE path is tested offline on a synthetic RELIANCE
+chart (`tests/_nse.py`), not on live data.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does
@@ -210,6 +273,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-*/market.py  the market profile (US or NSE), one identical copy per folder
 tests/              unittest suite + offline fixtures
 ```
 

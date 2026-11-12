@@ -97,6 +97,14 @@ ticker has no news, say so rather than padding the brief.
 - Never hammers a server: one request per feed per ticker, a pause between
   calls, and SEC's 10 requests a second limit stays far away.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. SEC filings are US only, so the NSE run shows Yahoo headlines and the day's move.
+
 ## Safety
 
 Education and tooling, not financial advice. This skill only reads and

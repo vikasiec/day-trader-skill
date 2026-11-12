@@ -200,6 +200,14 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
 - Never promises a fill price: a market order and a stop fill at whatever the market gives.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. The broker is "paper": a local paper ledger. There is no connector and no order leaves this computer. After the user's yes, look up the live price and record the fill with `ticket.py result --filled-price`. A stop-loss or take-profit rests nowhere, so trader-alerts must be running and the exit is recorded by hand. Never tell the user an NSE order was placed.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

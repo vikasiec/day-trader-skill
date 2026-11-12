@@ -154,6 +154,14 @@ It never places, approves or schedules an order, never raises a limit on its
 own, never shrinks a stop to fit more shares, and never sizes options,
 margin or short positions.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. The config keys keep their _usd names and hold rupees: with no config, Rs 500 max loss a trade and orders up to Rs 50,000. Charges (brokerage, STT, fees, GST, stamp duty) are not in the max-loss arithmetic.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

@@ -141,6 +141,11 @@ does not click it or automate it. The route:
 - Never places an order, and never copies options trades.
 - Never automates the Senate agreement or any login.
 
+## NSE India mode
+
+This skill reads US filings only. With `"market": "nse"` in `trader/config.json` say so and
+stop: there is no NSE version of it in this pack.
+
 ## Safety
 
 - Education and tooling, not financial advice. Nothing in this pack is a

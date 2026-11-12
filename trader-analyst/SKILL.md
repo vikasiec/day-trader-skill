@@ -116,6 +116,11 @@ so the summary read that 10-Q directly.
 - Never calls SEC without the User-Agent, and stays well under 10 requests a
   second.
 
+## NSE India mode
+
+This skill reads US filings only. With `"market": "nse"` in `trader/config.json` say so and
+stop: there is no NSE version of it in this pack.
+
 ## Safety
 
 Education and tooling, not financial advice. This skill only reads filings.

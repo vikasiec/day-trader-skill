@@ -160,6 +160,14 @@ It never places an order, never edits an order to make it pass, never
 loosens a limit, never blocks a sell that only gets the user out, and never
 treats a PASS as the user's yes.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. The config keys keep their _usd names and hold rupees: with no config, Rs 500 a trade and Rs 1,500 a day. The entry window is 09:30 to 15:00. pdt_guard is a US rule: leave it off.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

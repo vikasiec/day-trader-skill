@@ -148,6 +148,14 @@ watched; with `add --opening-bell`, the bell rings at 9:30.
 It never places, cancels or changes an order, never claims a quote is
 live, and never predicts where a price is going.
 
+## NSE India mode
+
+With `"market": "nse"` in `trader/config.json` (or `TRADER_MARKET=nse`) this tool runs on the
+NSE cash market: times are India Standard Time, the session is 09:15 to 15:30, the calendar is
+NSE's 2026 holiday list, symbols are plain NSE symbols (RELIANCE, M&M; Yahoo is asked for
+RELIANCE.NS) and money prints as Rs. Read every "New York", "ET" and "$" in this file as
+India time and rupees. Quotes come from Yahoo only (Stooq is US only here). On the paper ledger nothing rests at a broker: when a stop or target rings, build the exit with trader-broker flatten.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.
