@@ -1,0 +1,24 @@
+{
+  "data": {
+    "NSE_EQ": {
+      "2885": {
+        "last_price": 2456.75,
+        "volume": 5200000,
+        "average_price": 2450.0,
+        "buy_quantity": 150000,
+        "sell_quantity": 120000,
+        "oi": 0,
+        "ohlc": {"open": 2440.0, "high": 2465.0, "low": 2435.0, "close": 2442.50}
+      },
+      "3045": {
+        "last_price": 800.50,
+        "volume": 8000000,
+        "average_price": 798.0,
+        "buy_quantity": 200000,
+        "sell_quantity": 180000,
+        "oi": 0,
+        "ohlc": {"open": 795.0, "high": 805.0, "low": 793.0, "close": 798.0}
+      }
+    }
+  }
+}

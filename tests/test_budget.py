@@ -101,7 +101,8 @@ class TheReel(unittest.TestCase):
             "symbol": "TSLA", "side": "buy", "qty": "8", "type": "market", "time_in_force": "day",
             "order_class": "bracket", "take_profit_limit_price": "370.04", "stop_loss_stop_price": "358.32",
             "plan": {"entry": 364.18, "stop": 358.32, "target": 370.04, "risk_per_share": 5.86,
-                     "max_loss": 46.88, "setup": "orb", "entry_time": "10:15 AM", "flat_by": "15:55"}})
+                     "max_loss": 46.88,
+                     "setup": "orb", "entry_time": "10:15 AM", "flat_by": "15:55"}})
         self.assertIn("bound by your $50 max loss", why)
         self.assertIn("$46.88", why)
 

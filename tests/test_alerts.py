@@ -1,3 +1,4 @@
+import csv
 import datetime
 import gzip
 import io
@@ -131,6 +132,120 @@ class Quotes(unittest.TestCase):
             self.assertEqual((q["TSLA"]["price"], errors), (366.475, []))
         finally:
             shutil.rmtree(d)
+
+
+class DhanQuotes(unittest.TestCase):
+    MASTER = os.path.join(QDIR, "dhan-scrip-master.csv")
+    QUOTE = os.path.join(QDIR, "dhan-quote.json")
+
+    def setUp(self):
+        self.saved_market = alerts.MARKET
+        alerts.MARKET = "nse"
+
+    def tearDown(self):
+        alerts.MARKET = self.saved_market
+
+    def test_offline_dhan_quotes(self):
+        q, errors = alerts.get_quotes(["RELIANCE", "SBIN"], "dhan", QDIR)
+        self.assertEqual(sorted(q), ["RELIANCE", "SBIN"])
+        self.assertEqual(q["RELIANCE"]["price"], 2456.75)
+        self.assertEqual(q["RELIANCE"]["prev_close"], 2442.50)
+        self.assertEqual(q["RELIANCE"]["open"], 2440.0)
+        self.assertEqual(q["RELIANCE"]["source"], "dhan")
+        self.assertEqual(q["SBIN"]["price"], 800.50)
+        self.assertEqual(q["SBIN"]["prev_close"], 798.0)
+
+    def test_dhan_strips_ns_suffix(self):
+        q, errors = alerts.get_quotes(["RELIANCE.NS", "SBIN"], "dhan", QDIR)
+        self.assertIn("RELIANCE", q)
+        self.assertEqual(q["RELIANCE"]["price"], 2456.75)
+
+    def test_dhan_rejects_bo_suffix(self):
+        q, errors = alerts.get_quotes(["RELIANCE.BO"], "dhan", QDIR)
+        self.assertEqual(q, {})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("BSE", errors[0])
+
+    def test_dhan_unknown_symbol_is_an_error(self):
+        q, errors = alerts.get_quotes(["UNKNOWN_TICKER"], "dhan", QDIR)
+        self.assertEqual(q, {})
+
+    def test_parse_dhan_response(self):
+        with open(self.QUOTE) as fh:
+            data = json.load(fh)
+        sym_map = {"RELIANCE": "2885", "SBIN": "3045"}
+        quotes = alerts.parse_dhan(data, sym_map, ["RELIANCE", "SBIN"])
+        self.assertEqual(quotes["RELIANCE"]["price"], 2456.75)
+        self.assertEqual(quotes["SBIN"]["high"], 805.0)
+        self.assertEqual(quotes["SBIN"]["low"], 793.0)
+
+    def test_dhan_creds_required(self):
+        with self.assertRaises(alerts.AlertError) as ctx:
+            alerts._dhan_creds({})
+        self.assertIn("DHAN_ACCESS_TOKEN", str(ctx.exception))
+
+    def test_dhan_creds_from_environ(self):
+        token, client = alerts._dhan_creds({"DHAN_ACCESS_TOKEN": "tok123", "DHAN_CLIENT_ID": "cli456"})
+        self.assertEqual(token, "tok123")
+        self.assertEqual(client, "cli456")
+
+    def test_dhan_us_market_rejected(self):
+        saved = alerts.MARKET
+        try:
+            alerts.MARKET = "us"
+            with self.assertRaises(alerts.AlertError) as ctx:
+                alerts.get_quotes(["AAPL"], "dhan")
+            self.assertIn("NSE only", str(ctx.exception))
+        finally:
+            alerts.MARKET = saved
+
+    def test_nse_symbol_strips_ns(self):
+        self.assertEqual(alerts._nse_symbol("RELIANCE.NS"), "RELIANCE")
+        self.assertEqual(alerts._nse_symbol("SBIN"), "SBIN")
+        self.assertEqual(alerts._nse_symbol("M&M"), "M&M")
+
+    def test_scrip_master_csv_filtering(self):
+        sym_map = {}
+        with open(self.MASTER, encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                if (row.get("SEM_EXM_EXCH_ID") == "NSE" and
+                        row.get("SEM_SERIES", "").strip() == "EQ" and
+                        row.get("SEM_INSTRUMENT_NAME", "").strip() == "EQUITY"):
+                    sym_map[row["SEM_TRADING_SYMBOL"].strip().upper()] = \
+                        row["SEM_SMST_SECURITY_ID"].strip()
+        self.assertEqual(sorted(sym_map), ["HDFCBANK", "RELIANCE", "SBIN"])
+        self.assertNotIn("NIFTY 50", sym_map)
+
+    def test_dhan_headers_never_contain_token_in_url(self):
+        hdrs = alerts._dhan_headers("secret_tok", "client_123")
+        self.assertEqual(hdrs["access-token"], "secret_tok")
+        self.assertEqual(hdrs["client-id"], "client_123")
+        self.assertNotIn("secret_tok", alerts.DHAN_BASE)
+
+    def test_post_json_uses_urlopen_seam(self):
+        calls = []
+        saved = alerts._urlopen
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            self.assertEqual(req.get_method(), "POST")
+            self.assertIn("application/json", req.get_header("Content-type"))
+            body = json.loads(req.data.decode("utf-8"))
+            self.assertEqual(body, {"NSE_EQ": [2885]})
+            resp = json.dumps({"data": {"NSE_EQ": {"2885": {"last_price": 100.0}}}})
+            return io.BytesIO(resp.encode("utf-8"))
+
+        try:
+            alerts._urlopen = fake_urlopen
+            code, data = alerts._post_json("https://api.dhan.co/v2/marketfeed/quote",
+                                           alerts._dhan_headers("tok", "cli"),
+                                           {"NSE_EQ": [2885]})
+            self.assertEqual(code, 200)
+            self.assertEqual(data["data"]["NSE_EQ"]["2885"]["last_price"], 100.0)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0].full_url.startswith("https://api.dhan.co/v2/marketfeed/"))
+        finally:
+            alerts._urlopen = saved
 
 
 class FakeNet(object):

@@ -37,6 +37,12 @@ Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
           request per ticker, half a second apart; the default)
   stooq   https://stooq.com/q/l/?s=tsla.us&f=sd2t2ohlcv&h&e=csv (Stooq's free
           CSV; it answered 404 on 2026-10-13, kept for when it is back)
+  dhan    Dhan v2 REST API /marketfeed/quote (NSE only; needs DHAN_ACCESS_TOKEN
+          and DHAN_CLIENT_ID in the environment). Fetches a scrip master CSV
+          once per IST date to map symbols to numeric security IDs, caches the
+          map under trader/state/. One POST for all symbols. Not free, delayed
+          or unofficial: it is your broker's own quote, subject to your Dhan
+          plan's terms. Still for alerts and sizing only, never for an order.
   --offline DIR reads DIR/<source>-<TICKER>.json|csv (or .json.gz) instead.
 
 NYSE calendar: the 2026 and 2027 holidays and 1:00 p.m. early closes as
@@ -361,6 +367,228 @@ def fetch_yahoo(sym, timeout=20):
     raise AlertError("%s answered HTTP %d" % (last[0].split("?")[0], last[1]))
 
 
+# ---------------------------------------------------------------- Dhan quotes (NSE only)
+
+DHAN_BASE = "https://api.dhan.co/v2"
+DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+DHAN_REQUIRED_COLS = {"SEM_EXM_EXCH_ID", "SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL", "SEM_SERIES",
+                      "SEM_INSTRUMENT_NAME"}
+
+
+def _dhan_creds(environ=None):
+    """(access_token, client_id) from the environment, or raise."""
+    env = os.environ if environ is None else environ
+    token = env.get("DHAN_ACCESS_TOKEN", "").strip()
+    client = env.get("DHAN_CLIENT_ID", "").strip()
+    if not token or not client:
+        raise AlertError("Dhan quotes need DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID in the environment")
+    return token, client
+
+
+def _dhan_headers(token, client_id):
+    return {"access-token": token, "client-id": client_id,
+            "Content-Type": "application/json", "Accept": "application/json"}
+
+
+def _post_json(url, headers, body, timeout=20):
+    """POST JSON through the same _urlopen seam tests can swap. Returns (status, parsed_json)."""
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with _urlopen(req, timeout=timeout) as r:
+            return 200, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
+        try:
+            body_json = json.loads(raw)
+        except ValueError:
+            body_json = {"raw": raw[:200]}
+        return e.code, body_json
+    except urllib.error.URLError as e:
+        raise AlertError("could not reach api.dhan.co: %s" % e.reason)
+
+
+def _load_scrip_master(cache_dir="trader/state", environ=None):
+    """Symbol -> security_id map for NSE equities. Cached by IST date.
+
+    Downloads the Dhan instruments CSV (~7 MB) once per day and stores the
+    parsed {symbol: id} map as a small JSON file under cache_dir."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    ist = now_utc + datetime.timedelta(hours=5, minutes=30)
+    date_key = ist.strftime("%Y-%m-%d")
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, "dhan-scrip-%s.json" % date_key) if cache_dir else None
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as fh:
+            return json.load(fh)
+    code, text = _get(DHAN_INSTRUMENTS_URL, timeout=60)
+    if code != 200:
+        raise AlertError("Dhan instruments CSV: HTTP %d" % code)
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None:
+        raise AlertError("Dhan instruments CSV has no header row")
+    missing = DHAN_REQUIRED_COLS - set(reader.fieldnames)
+    if missing:
+        raise AlertError("Dhan instruments CSV missing columns: %s" % ", ".join(sorted(missing)))
+    sym_map = {}
+    for row in reader:
+        if row.get("SEM_EXM_EXCH_ID") != "NSE":
+            continue
+        if row.get("SEM_SERIES", "").strip() != "EQ":
+            continue
+        if row.get("SEM_INSTRUMENT_NAME", "").strip() != "EQUITY":
+            continue
+        symbol = row["SEM_TRADING_SYMBOL"].strip().upper()
+        sec_id = row["SEM_SMST_SECURITY_ID"].strip()
+        if symbol and sec_id:
+            sym_map[symbol] = sec_id
+    if not sym_map:
+        raise AlertError("Dhan instruments CSV had no NSE equity rows")
+    if cache_path:
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(sym_map, fh)
+        os.replace(tmp, cache_path)
+    return sym_map
+
+
+_dhan_scrip_cache = {}
+
+
+def _scrip_map(cache_dir="trader/state", environ=None, offline_map=None):
+    """Cached in-process: the map is stable for a trading day."""
+    if offline_map is not None:
+        return offline_map
+    key = cache_dir or ""
+    if key not in _dhan_scrip_cache:
+        _dhan_scrip_cache[key] = _load_scrip_master(cache_dir, environ)
+    return _dhan_scrip_cache[key]
+
+
+def _nse_symbol(sym):
+    """Strip Yahoo suffix (.NS) from an NSE symbol; reject .BO."""
+    s = sym.strip().upper()
+    if s.endswith(".BO"):
+        raise AlertError("%s is a BSE symbol; Dhan quotes in this tool are NSE only" % s)
+    if s.endswith(".NS"):
+        s = s[:-3]
+    return s
+
+
+def parse_dhan(data, sym_map, symbols):
+    """Dhan /marketfeed/quote response -> {SYM: quote}."""
+    nse_data = data.get("data", {}).get("NSE_EQ", {})
+    id_to_sym = {v: k for k, v in sym_map.items()}
+    quotes = {}
+    for sym in symbols:
+        sec_id = sym_map.get(sym)
+        if not sec_id:
+            continue
+        entry = nse_data.get(str(sec_id), nse_data.get(sec_id))
+        if entry is None:
+            continue
+        ltp = entry.get("last_price", entry.get("ltp"))
+        if ltp is None:
+            continue
+        ohlc = entry.get("ohlc") or {}
+        prev_close = None
+        if isinstance(ohlc, dict):
+            c = ohlc.get("close")
+            if c is not None:
+                try:
+                    prev_close = float(c)
+                except (TypeError, ValueError):
+                    pass
+        o = ohlc.get("open") if isinstance(ohlc, dict) else None
+        h = ohlc.get("high") if isinstance(ohlc, dict) else None
+        lo = ohlc.get("low") if isinstance(ohlc, dict) else None
+        quotes[sym] = {
+            "symbol": sym, "price": float(ltp),
+            "open": float(o) if o is not None else None,
+            "high": float(h) if h is not None else None,
+            "low": float(lo) if lo is not None else None,
+            "prev_close": prev_close if prev_close and prev_close > 0 else None,
+            "time": "", "source": "dhan",
+        }
+    return quotes
+
+
+def fetch_dhan(symbols, environ=None, cache_dir="trader/state", offline_map=None):
+    """Fetch quotes for NSE symbols via Dhan /marketfeed/quote. One POST for all.
+
+    Returns ({SYM: quote}, [errors])."""
+    token, client_id = _dhan_creds(environ)
+    sym_map = _scrip_map(cache_dir, environ, offline_map)
+    quotes, errors = {}, []
+    ids = []
+    sym_for_id = {}
+    for sym in symbols:
+        try:
+            clean = _nse_symbol(sym)
+        except AlertError as e:
+            errors.append(str(e))
+            continue
+        sec_id = sym_map.get(clean)
+        if not sec_id:
+            errors.append("no Dhan security ID for %s (not in the NSE equity scrip master)" % clean)
+            continue
+        ids.append(int(sec_id))
+        sym_for_id[sec_id] = clean
+    if not ids:
+        return quotes, errors
+    hdrs = _dhan_headers(token, client_id)
+    url = DHAN_BASE + "/marketfeed/quote"
+    code, body = _post_json(url, hdrs, {"NSE_EQ": ids})
+    if code == 429:
+        _sleep(BACKOFF)
+        code, body = _post_json(url, hdrs, {"NSE_EQ": ids})
+    if code == 401:
+        raise AlertError("Dhan rejected the token (HTTP 401): token expired or invalid. "
+                         "Regenerate DHAN_ACCESS_TOKEN (tokens last 24 hours).")
+    if code != 200:
+        raise AlertError("Dhan /marketfeed/quote: HTTP %d" % code)
+    nse_data = body.get("data", {}).get("NSE_EQ", {})
+    for sec_id_str, clean in sym_for_id.items():
+        entry = nse_data.get(str(sec_id_str), nse_data.get(sec_id_str))
+        if entry is None:
+            errors.append("Dhan returned no data for %s" % clean)
+            continue
+        ltp = entry.get("last_price", entry.get("ltp"))
+        if ltp is None:
+            errors.append("Dhan returned no price for %s" % clean)
+            continue
+        ohlc = entry.get("ohlc") or {}
+        prev_close = None
+        if isinstance(ohlc, dict):
+            c = ohlc.get("close")
+            if c is not None:
+                try:
+                    prev_close = float(c)
+                except (TypeError, ValueError):
+                    pass
+        o = ohlc.get("open") if isinstance(ohlc, dict) else None
+        h = ohlc.get("high") if isinstance(ohlc, dict) else None
+        lo = ohlc.get("low") if isinstance(ohlc, dict) else None
+        quotes[clean] = {
+            "symbol": clean, "price": float(ltp),
+            "open": float(o) if o is not None else None,
+            "high": float(h) if h is not None else None,
+            "low": float(lo) if lo is not None else None,
+            "prev_close": prev_close if prev_close and prev_close > 0 else None,
+            "time": "", "source": "dhan",
+        }
+    return quotes, errors
+
+
 def _offline_text(folder, source, sym):
     ext = "csv" if source == "stooq" else "json"
     base = os.path.join(folder, "%s-%s.%s" % (source, sym, ext))
@@ -373,8 +601,36 @@ def _offline_text(folder, source, sym):
     raise AlertError("no offline quote file %s" % base)
 
 
-def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
-    """{SYM: quote} and [errors]. One request per ticker, with a pause between."""
+def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE, environ=None):
+    """{SYM: quote} and [errors]. One request per ticker, with a pause between.
+
+    source "dhan" sends one POST for all symbols (NSE only, needs env vars)."""
+    if source == "dhan":
+        if MARKET == "us":
+            raise AlertError("Dhan quotes are NSE only: use --source yahoo for US stocks")
+        if offline:
+            sym_map = {}
+            master_path = os.path.join(offline, "dhan-scrip-master.csv")
+            if os.path.exists(master_path):
+                with open(master_path, encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh):
+                        if (row.get("SEM_EXM_EXCH_ID") == "NSE" and
+                                row.get("SEM_SERIES", "").strip() == "EQ" and
+                                row.get("SEM_INSTRUMENT_NAME", "").strip() == "EQUITY"):
+                            sym_map[row["SEM_TRADING_SYMBOL"].strip().upper()] = \
+                                row["SEM_SMST_SECURITY_ID"].strip()
+            clean_syms = []
+            errs = []
+            for s in symbols:
+                try:
+                    clean_syms.append(_nse_symbol(s.upper()))
+                except AlertError as e:
+                    errs.append(str(e))
+            text = _offline_text(offline, "dhan", "quote")
+            data = json.loads(text)
+            quotes = parse_dhan(data, sym_map, clean_syms)
+            return quotes, errs
+        return fetch_dhan([s.upper() for s in symbols], environ)
     quotes, errors = {}, []
     for i, sym in enumerate(symbols):
         sym = sym.upper()
@@ -790,7 +1046,7 @@ def _main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
-        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq"])
+        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq", "dhan"])
         p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
         p.add_argument("--now", help="pretend it is this time (no offset = New York time)")
         p.add_argument("--json", action="store_true")

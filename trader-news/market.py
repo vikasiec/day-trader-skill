@@ -199,3 +199,125 @@ def output(name):
         yield
     finally:
         sys.stdout, sys.stderr = out, err
+
+
+# ---------------------------------------------------------------- NSE tick size
+
+# NSE price-banded tick sizes for the cash (CM) segment, effective
+# April 15, 2025 (as summarized by zerodha.com/marketintel bulletin
+# 408151 and marketcalls.in, both citing NSE circular NSE/CMTR/67133
+# which partially modifies the May 2024 revision NSE/CMTR/62174;
+# read 2026-11-14). The tick for a stock is set monthly from its
+# previous-month close; ETFs are excluded. Near a band boundary,
+# the broker's tick may differ from the one this code picks from
+# the current price.
+_US_TICK = 0.01
+
+
+def tick_size(name, price):
+    """The tick size for this price. US: always 0.01. NSE: price-banded."""
+    if name == "us":
+        return _US_TICK
+    p = abs(float(price))
+    if p < 250:
+        return 0.01
+    if p <= 1000:
+        return 0.05
+    if p <= 5000:
+        return 0.10
+    if p <= 10000:
+        return 0.50
+    if p <= 20000:
+        return 1.00
+    return 5.00
+
+
+def round_to_tick(name, price, direction="nearest"):
+    """Round a price to the market's tick size.
+
+    direction:
+      "nearest"  normal rounding (half away from zero)
+      "down"     toward zero (for a long's stop, away from entry)
+      "up"       away from zero (for a long's target)
+
+    US: rounds to the cent. NSE: price-banded ticks."""
+    tick = tick_size(name, price)
+    p = round(float(price) * 100)
+    t = round(tick * 100)
+    if direction == "down":
+        return (p // t * t) / 100.0
+    elif direction == "up":
+        return (-(-p // t) * t) / 100.0
+    else:
+        return (((p + t // 2) // t) * t) / 100.0
+
+
+# ---------------------------------------------------------------- NSE intraday transaction costs
+
+# Default charges for NSE cash equity intraday (MIS/CO) trades. Statutory
+# rates (STT, exchange, SEBI, stamp duty, GST) are from SEBI and NSE fee
+# schedules; brokerage is the typical discount-broker tariff. Verify
+# against your own broker's schedule before relying on these defaults.
+_NSE_BROKERAGE_FLAT = 20.0          # Rs per executed order (discount broker cap)
+_NSE_BROKERAGE_PCT = 0.0003         # 0.03% - the lesser of flat and pct applies
+_NSE_STT_PCT = 0.00025              # 0.025% on sell side only (intraday equity)
+_NSE_EXCHANGE_TURNOVER_PCT = 0.0000297   # NSE transaction charge
+_NSE_SEBI_FEE_PCT = 0.000001        # SEBI turnover fee
+_NSE_STAMP_DUTY_PCT = 0.00003       # 0.003% on buy side (state-level, capped)
+_NSE_GST_PCT = 0.18                 # 18% GST on brokerage + exchange + SEBI
+
+# Slippage is an estimate, not a statutory charge. Config key overrides it.
+_NSE_SLIPPAGE_PER_LEG_PCT = 0.0003  # 0.03% per leg, conservative for liquid stocks
+
+
+def nse_charges(buy_value, sell_value, slippage_per_leg_pct=None):
+    """Round-trip transaction costs for an NSE intraday equity trade.
+
+    Returns a dict with each component and the total, all in rupees."""
+    if slippage_per_leg_pct is None:
+        slippage_per_leg_pct = _NSE_SLIPPAGE_PER_LEG_PCT
+    buy_brokerage = min(_NSE_BROKERAGE_FLAT, buy_value * _NSE_BROKERAGE_PCT)
+    sell_brokerage = min(_NSE_BROKERAGE_FLAT, sell_value * _NSE_BROKERAGE_PCT)
+    brokerage = buy_brokerage + sell_brokerage
+    stt = sell_value * _NSE_STT_PCT
+    turnover = buy_value + sell_value
+    exchange_turnover = turnover * _NSE_EXCHANGE_TURNOVER_PCT
+    sebi_fee = turnover * _NSE_SEBI_FEE_PCT
+    stamp_duty = buy_value * _NSE_STAMP_DUTY_PCT
+    gst = (brokerage + exchange_turnover + sebi_fee) * _NSE_GST_PCT
+    slippage = (buy_value + sell_value) * slippage_per_leg_pct
+    statutory = brokerage + stt + exchange_turnover + sebi_fee + stamp_duty + gst
+    total = statutory + slippage
+    return {
+        "brokerage": round(brokerage, 2),
+        "stt": round(stt, 2),
+        "exchange_turnover": round(exchange_turnover, 2),
+        "sebi_fee": round(sebi_fee, 2),
+        "stamp_duty": round(stamp_duty, 2),
+        "gst": round(gst, 2),
+        "slippage": round(slippage, 2),
+        "slippage_pct": slippage_per_leg_pct,
+        "statutory": round(statutory, 2),
+        "total": round(total, 2),
+    }
+
+
+def trade_charges(name, qty, entry, stop, cfg=None):
+    """Estimated round-trip charges for a trade of qty shares at entry, exiting at stop.
+
+    Returns {"charges": total, "breakdown": {...}} or {"charges": 0, "breakdown": None}
+    for the US market. The config key "slippage_pct" overrides the default estimate."""
+    if name == "us":
+        return {"charges": 0.0, "breakdown": None}
+    slip = None
+    if isinstance(cfg, dict):
+        v = cfg.get("slippage_pct")
+        if v is not None:
+            try:
+                slip = float(v)
+            except (TypeError, ValueError):
+                pass
+    buy_value = qty * float(entry)
+    sell_value = qty * float(stop)
+    bd = nse_charges(buy_value, sell_value, slip)
+    return {"charges": bd["total"], "breakdown": bd}

@@ -189,7 +189,8 @@ on the NSE the amounts are rupees.
 What works: `/trader-scanner`, `/trader-news` (Yahoo headlines and the day's
 move), `/trader-entry`, `/trader-exit`, `/trader-timemachine` (75 five-minute
 bars a session), `/trader-budget`, `/trader-risk`, `/trader-broker` (paper
-ledger) and `/trader-alerts` (Yahoo quotes).
+ledger) and `/trader-alerts` (Yahoo quotes, or Dhan quotes with `--source dhan`
+and your `DHAN_ACCESS_TOKEN` / `DHAN_CLIENT_ID` in the environment).
 
 What does not, and what to know:
 
@@ -197,10 +198,17 @@ What does not, and what to know:
 - No live orders. `/trader-broker` shows the ticket, records your yes and
   writes the paper fill you give it to `trader/portfolio.json`. A stop-loss or
   a take-profit rests nowhere: `/trader-alerts` rings and you record the exit.
-- Charges are not in the max-loss arithmetic: brokerage, STT, exchange and SEBI
-  fees, GST and stamp duty come on top.
-- Prices are planned to the paisa. NSE tick sizes depend on the share price,
-  so a real order is rounded by your broker.
+- `/trader-risk` includes round-trip charges (brokerage, STT, exchange and SEBI
+  fees, GST, stamp duty, and an estimated 0.03%/leg slippage that
+  `slippage_pct` in the config can override) in the max-loss check for NSE
+  trades. `/trader-budget` sizes within that limit and shows the breakdown.
+  US trades are unaffected.
+- Stops and targets are rounded to the NSE tick size (1 paisa below Rs 250,
+  5 paisa to Rs 1,000, 10 paisa to Rs 5,000, then 50p / Re 1 / Rs 5 above;
+  as summarized from NSE circular CMTR/67133, effective April 15, 2025). The
+  tick for a stock is set monthly from its previous-month close, so near a
+  band boundary the broker's tick may differ from the one this code picks from
+  the current price. US prices are unchanged.
 - The holiday list is 2026 only. NSE publishes the next year's list each
   December: add it to `NSE_HOLIDAYS` and `CALENDAR_YEARS` in `market.py` and
   copy the file over the other eight (`tests/test_market.py` checks they
@@ -208,8 +216,10 @@ What does not, and what to know:
 - If NSE's archive does not answer, `scan.py universe` writes a built-in list
   of large caps and says so. Or keep your own list in `trader/universe.txt`.
 - Yahoo's NSE bars are free and unofficial and may run behind the exchange.
-  Every tool prints the time of the data it used: check it against your broker
-  before you act on a trigger.
+  With `--source dhan`, quotes come from the Dhan v2 API (your broker's own
+  price, not a free feed) and require `DHAN_ACCESS_TOKEN` and `DHAN_CLIENT_ID`
+  in the environment. Every tool prints the time of the data it used: check it
+  against your broker before you act on a trigger.
 
 `market.py` holds the profile; the same copy sits in each of the nine skill
 folders that need it. The NSE path is tested offline on a synthetic RELIANCE

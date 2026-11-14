@@ -201,7 +201,7 @@ class OneTradeOnTheNSE(unittest.TestCase):
         self.assertAlmostEqual(doc["mc"]["p_target"] + doc["mc"]["p_stop"] + doc["mc"]["p_neither"], 1.0, places=3)
         self.assertEqual(doc["history"]["sessions"], 30)
 
-        # budget: Rs 500 max loss / 7.50 risk = 66 shares, but Rs 50,000 max order / 1412.50 = 35
+        # budget: Rs 500 max loss (with charges) < 66 shares, but Rs 50,000 max order / 1412.50 = 35
         size = load("trader-budget", "size")
         code, out, err = run(size, ["--now", NOW, "--write"])
         self.assertEqual(code, 0, out + err)
@@ -326,6 +326,149 @@ class OneTradeOnTheNSE(unittest.TestCase):
         code, out, err = run(news, ["--tickers", "RELIANCE", "--offline", "feeds", "--no-moves", "--dry-run"])
         self.assertIn("SEC filings are US only", out + err)
         self.assertNotIn("sec_user_agent", out + err)
+
+
+class TickRounding(unittest.TestCase):
+    """round_to_tick integer-paise arithmetic and tick_size band boundaries."""
+
+    def test_on_tick_prices_are_unchanged(self):
+        cases = [
+            (100.0, 0.01), (249.99, 0.01),
+            (250.0, 0.05), (500.0, 0.05), (1000.0, 0.05),
+            (1000.10, 0.10), (2500.0, 0.10), (5000.0, 0.10),
+            (5000.50, 0.50), (7500.0, 0.50), (10000.0, 0.50),
+            (10001.0, 1.0), (15000.0, 1.0), (20000.0, 1.0),
+            (20005.0, 5.0), (50000.0, 5.0),
+        ]
+        for price, expected_tick in cases:
+            self.assertEqual(market.tick_size("nse", price), expected_tick,
+                             "tick_size(%s) should be %s" % (price, expected_tick))
+            for d in ("nearest", "down", "up"):
+                self.assertEqual(market.round_to_tick("nse", price, d), price,
+                                 "round_to_tick(%s, %s) should stay %s" % (price, d, price))
+
+    def test_band_boundaries(self):
+        self.assertEqual(market.tick_size("nse", 249.99), 0.01)
+        self.assertEqual(market.tick_size("nse", 250.0), 0.05)
+        self.assertEqual(market.tick_size("nse", 1000.0), 0.05)
+        self.assertEqual(market.tick_size("nse", 1000.01), 0.10)
+        self.assertEqual(market.tick_size("nse", 5000.0), 0.10)
+        self.assertEqual(market.tick_size("nse", 5000.01), 0.50)
+        self.assertEqual(market.tick_size("nse", 10000.0), 0.50)
+        self.assertEqual(market.tick_size("nse", 10000.01), 1.00)
+        self.assertEqual(market.tick_size("nse", 20000.0), 1.00)
+        self.assertEqual(market.tick_size("nse", 20000.01), 5.00)
+
+    def test_float_precision_regression(self):
+        self.assertEqual(market.round_to_tick("nse", 1000.30, "down"), 1000.30)
+        self.assertEqual(market.round_to_tick("nse", 1000.30, "up"), 1000.30)
+        self.assertEqual(market.round_to_tick("nse", 1000.30, "nearest"), 1000.30)
+
+    def test_off_tick_rounding(self):
+        self.assertEqual(market.round_to_tick("nse", 1405.03, "down"), 1405.0)
+        self.assertEqual(market.round_to_tick("nse", 1405.03, "up"), 1405.1)
+        self.assertEqual(market.round_to_tick("nse", 249.97, "down"), 249.97)
+        self.assertEqual(market.round_to_tick("nse", 249.97, "up"), 249.97)
+        self.assertEqual(market.round_to_tick("nse", 500.03, "down"), 500.0)
+        self.assertEqual(market.round_to_tick("nse", 500.03, "up"), 500.05)
+
+    def test_us_tick_is_always_one_cent(self):
+        self.assertEqual(market.tick_size("us", 1.0), 0.01)
+        self.assertEqual(market.tick_size("us", 50000.0), 0.01)
+
+
+class NSEChargesAndTickRounding(unittest.TestCase):
+    """Budget and risk agree on NSE when max-loss binds, the stop is off-tick,
+    and charges are counted."""
+
+    def setUp(self):
+        self.old = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.makedirs("trader")
+        with open("trader/config.json", "w") as fh:
+            json.dump({"market": "nse", "budget": 500000,
+                       "max_loss_per_trade_usd": 500,
+                       "max_order_usd": 500000,
+                       "max_position_pct": 100,
+                       "max_daily_loss_usd": 5000}, fh)
+
+    def tearDown(self):
+        os.chdir(self.old)
+        shutil.rmtree(self.tmp)
+
+    def test_budget_and_risk_agree_on_nse_with_off_tick_stop(self):
+        size = load("trader-budget", "size")
+        check = load("trader-risk", "check")
+        size.use_market("nse")
+        check.use_market("nse")
+        try:
+            plan = {"symbol": "RELIANCE", "side": "buy", "entry": 1412.50,
+                    "stop": 1405.03, "target": 1427.50, "setup": "orb",
+                    "date": "2026-11-12", "entry_time": "10:00 AM", "flat_by": "15:10"}
+            cfg = {"budget": 500000, "max_loss_per_trade_usd": 500,
+                   "max_order_usd": 500000, "max_position_pct": 100,
+                   "max_daily_loss_usd": 5000, "max_trades_per_day": 3,
+                   "max_orders_per_day": 10, "min_reward_risk": 1.0,
+                   "require_stop": True, "paper": True,
+                   "no_entries_before": "09:30", "no_entries_after": "15:00",
+                   "cash_buffer_pct": 10, "min_order_usd": 100,
+                   "blocked": [], "allow_options": False,
+                   "allow_margin": False, "allow_short": False, "pdt_guard": False}
+            s = size.size_trade(plan, cfg, today="2026-11-12")
+            # The stop 1405.03 should be rounded down to 1405.0 (tick = 0.10)
+            self.assertEqual(s["stop"], 1405.0)
+            self.assertEqual(s["target"], 1427.5)
+            self.assertEqual(s["bound_by"], "max loss")
+            # Charges should be present on NSE and shrink the size
+            self.assertIn("charges", s)
+            self.assertGreater(s["charges"], 0)
+            self.assertLess(s["qty"], size.shares_for(500, s["risk_per_share"]))
+            order = size.bracket_order(s)
+            self.assertIsNotNone(order)
+            self.assertEqual(order["stop_loss_stop_price"], "1405.00")
+            # Now run risk check on the same order, at an in-window time
+            now_ist = "2026-11-12 10:00"
+            res = check.check([order], cfg, prices={"RELIANCE": 1412.50},
+                              today="2026-11-12", now=check.parse_now(now_ist))
+            self.assertEqual(res["block"], 0, [r["reasons"] for r in res["results"]])
+            r = res["results"][0]
+            self.assertEqual(r["verdict"], "PASS")
+            # Risk's numbers must match budget's
+            self.assertEqual(r["risk_per_share"], s["risk_per_share"])
+            self.assertEqual(r["max_loss"], s["max_loss"])
+            # One more share should be blocked by the per-trade loss limit
+            over_order = dict(order)
+            over_order["qty"] = str(int(order["qty"]) + 1)
+            over_res = check.check([over_order], cfg, prices={"RELIANCE": 1412.50},
+                                   today="2026-11-12", now=check.parse_now(now_ist))
+            over_r = over_res["results"][0]
+            self.assertTrue(any(x.startswith("loss:") for x in over_r["reasons"]),
+                            "expected loss: block with +1 share, got: %s" % over_r["reasons"])
+        finally:
+            size.use_market("us")
+            check.use_market("us")
+
+    def test_us_output_has_no_charges_fields(self):
+        size = load("trader-budget", "size")
+        plan = {"symbol": "TSLA", "side": "buy", "entry": 364.18,
+                "stop": 358.32, "target": 370.04, "setup": "orb",
+                "date": "2026-10-19", "entry_time": "10:15 AM", "flat_by": "15:55"}
+        cfg = {"budget": 5000, "max_loss_per_trade_usd": 50,
+               "max_order_usd": 4000, "max_position_pct": 75,
+               "cash_buffer_pct": 10, "min_order_usd": 5,
+               "max_daily_loss_usd": 150, "min_reward_risk": 1.0,
+               "require_stop": True, "paper": True,
+               "no_entries_before": "09:45", "no_entries_after": "15:30",
+               "blocked": [], "allow_options": False,
+               "allow_margin": False, "allow_short": False, "pdt_guard": False}
+        s = size.size_trade(plan, cfg, today="2026-10-19")
+        self.assertNotIn("charges", s)
+        self.assertNotIn("max_loss_with_charges", s)
+        self.assertNotIn("charges_breakdown", s)
+        order = size.bracket_order(s)
+        self.assertNotIn("charges", order["plan"])
+        self.assertNotIn("max_loss_with_charges", order["plan"])
 
 
 class TheUSDefaultIsUntouched(unittest.TestCase):

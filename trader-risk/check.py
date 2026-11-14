@@ -39,13 +39,15 @@ What blocks an entry (on top):
   daily limit   max_orders_per_day orders placed today
   stop          no stop while "require_stop": true (a bracket stop_loss_stop_price
                 or the order's plan stop); a stop on the wrong side of the entry
-  loss          qty x (entry - stop) over max_loss_per_trade_usd. The entry is
-                the limit price for a limit order, else the HIGHER of the plan's
-                entry and a fresh price (under 15 minutes old), so a stale plan
-                cannot understate the risk
+  loss          qty x (entry - stop) + charges (on NSE) over
+                max_loss_per_trade_usd. The entry is the limit price for a
+                limit order, else the HIGHER of the plan's entry and a fresh
+                price (under 15 minutes old), so a stale plan cannot understate
+                the risk
   reward:risk   (target - entry) / (entry - stop) under min_reward_risk
-  daily loss    the max losses at the stops of today's entries plus this one
-                over max_daily_loss_usd (win or lose, each counts in full)
+  daily loss    the max losses (with charges on NSE) at the stops of today's
+                entries plus this one over max_daily_loss_usd (win or lose,
+                each counts in full)
   trades        max_trades_per_day entries already placed today
   window        before no_entries_before or after no_entries_after (New York
                 time), or the market is closed (weekend, NYSE holiday, outside
@@ -449,7 +451,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     entries_today = [r for r in done_today if rec_is_entry(r)]
     loss_today = 0.0
     for r in entries_today:
-        ml = _f(r.get("max_loss"))
+        ml = _f(r.get("max_loss_with_charges")) or _f(r.get("max_loss"))
         if ml is None:
             top_warn.append("an entry placed today (%s %s) has no max loss in the log; not counted in "
                             "the daily loss" % (r.get("side"), r.get("symbol")))
@@ -634,6 +636,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
 
         # day-trade checks: stop, loss, reward:risk, daily loss, trades, window, pdt
         max_loss = risk_ps = rr = stop = target = None
+        charges = 0.0
+        max_loss_charged = None
         if kind == "entry" and side in ("buy", "sell"):
             long = side == "buy"
             leg_stop, plan_stop = _f(o.get("stop_loss_stop_price")), _f(plan.get("stop"))
@@ -660,10 +664,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     risk_ps = risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
                     max_loss = round(shares * risk_ps, 2)
+                    charges_info = MKT.trade_charges(MARKET, shares, ref, stop, c)
+                    charges = charges_info["charges"]
+                    max_loss_charged = round(max_loss + charges, 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
-                    if cap and max_loss > cap + CENT:
-                        later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                    if cap and max_loss_charged > cap + CENT:
+                        loss_text = "%s at the stop" % money(max_loss)
+                        if charges > 0:
+                            loss_text = "%s at the stop + %s charges = %s" % (money(max_loss), money(charges), money(max_loss_charged))
+                        later.append("loss: %s shares x %s risk a share = %s, over your %s max loss "
+                                     "per trade" % (_num(shares), _p(risk_ps), loss_text, money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
                         if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
@@ -680,9 +690,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             daily = _f(c.get("max_daily_loss_usd"))
             if daily and max_loss is not None:
                 used = loss_today + batch_loss
-                if used + max_loss > daily + CENT:
+                trade_loss = max_loss_charged if charges > 0 else max_loss
+                if used + trade_loss > daily + CENT:
                     later.append("daily loss: %s already at risk today plus %s for this one = %s, over your %s "
-                                 "daily loss limit" % (money(used), money(max_loss), money(used + max_loss),
+                                 "daily loss limit" % (money(used), money(trade_loss), money(used + trade_loss),
                                                        money(daily)))
             cap_t = int(c.get("max_trades_per_day") or 0)
             if cap_t and len(entries_today) + batch_entries >= cap_t:
@@ -697,8 +708,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 info.append("entry %s (%s), stop %s, target %s: risk %s a share"
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
                                _p(target) if target else "none", _p(risk_ps)))
+                loss_label = money(max_loss)
+                if charges > 0:
+                    loss_label = "%s + %s charges = %s" % (money(max_loss), money(charges), money(max_loss_charged))
                 info.append("max loss %s%s, reward:risk %s%s"
-                            % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
+                            % (loss_label, (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
                                ("%.2f" % rr) if rr is not None else "n/a",
                                (" (min %s)" % _num(c["min_reward_risk"])) if _f(c.get("min_reward_risk")) else ""))
@@ -729,7 +743,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if verdict == "PASS":
             if kind == "entry" and side in ("buy", "sell"):
                 batch_entries += 1
-                batch_loss += max_loss or 0.0
+                batch_loss += (max_loss_charged if max_loss_charged is not None else max_loss) or 0.0
             if side == "buy":
                 if value is not None:
                     acct["cash"] -= value
@@ -746,7 +760,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held - q
                 elif ref and value is not None:
                     acct["shares"][sym] = held - value / ref
-        results.append({
+        rec = {
             "index": i, "symbol": sym, "side": side, "kind": kind,
             "amount": money(_f(notional) or 0) if notional is not None else ("%s shares" % qty),
             "value_usd": round(value, 2) if value is not None else None,
@@ -754,7 +768,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
             "reward_risk": rr, "fingerprint": fingerprint(o), "verdict": verdict,
             "reasons": reasons, "warnings": warns, "info": info,
-        })
+        }
+        if max_loss_charged is not None and max_loss_charged != max_loss:
+            rec["max_loss_with_charges"] = max_loss_charged
+        results.append(rec)
 
     return {
         "date": today,

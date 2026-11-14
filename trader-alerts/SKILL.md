@@ -77,6 +77,11 @@ close, so "flat by close" at 15:55 rings at 12:55 on those days.
   tries `query1`. It identifies itself as `day-trader-skill/2.0`.
 - `stooq`: `stooq.com/q/l/?s=tsla.us&f=sd2t2ohlcv&h&e=csv`, Stooq's free CSV.
   It answered 404 on 2026-10-13; the parser stays for when it is back.
+- `dhan` (NSE only): Dhan v2 REST API `/marketfeed/quote`, one POST for all
+  symbols. Needs `DHAN_ACCESS_TOKEN` and `DHAN_CLIENT_ID` in the environment.
+  Downloads the Dhan scrip master CSV once per IST date and caches the
+  symbol-to-ID map under `trader/state/`. Not free or unofficial: it is
+  your broker's own quote, subject to your Dhan plan's terms.
 - Free quotes are unofficial, delayed and can lag. They are fine for alerts
   and for checking a size, not for timing an order. The broker's price is the
   one that fills. Each price in `trader/prices.json` keeps its quote time, and

@@ -16,7 +16,8 @@ checks the order and trader-broker asks you yes or no.
 How many shares. Whole shares only: Alpaca takes no fractions in a bracket.
 
     shares = floor of the smallest of
-      max loss       max_loss_per_trade_usd / risk per share (entry minus stop)
+      max loss       max_loss_per_trade_usd / risk per share (entry minus stop);
+                     on NSE, charges are included and the limit is tightened
       position cap   budget x max_position_pct / entry
       max order      max_order_usd / entry
       cash           (budget minus the cash buffer) / entry
@@ -406,6 +407,11 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     else:
         ref, ref_from = round_cent(entry_plan), "plan"
     stop, target = round_cent(stop), round_cent(target)
+    # NSE tick size: round stop down (away from entry) and target up, before
+    # validation and risk computation so the bracket legs match what we check.
+    if MARKET != "us":
+        stop = MKT.round_to_tick(MARKET, stop, "down")
+        target = MKT.round_to_tick(MARKET, target, "up")
     if stop >= ref:
         raise SizeError("the stop %s is not below the entry %s; a long trade needs its stop underneath"
                         % (_price(stop), _price(ref)))
@@ -427,8 +433,22 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     limits = []
     max_loss = _f(c.get("max_loss_per_trade_usd"))
     if max_loss:
-        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk),
-                       "how": "%s max loss / %s risk a share" % (money(max_loss), _price(risk))})
+        ml_shares = shares_for(max_loss, risk)
+        ml_how = "%s max loss / %s risk a share" % (money(max_loss), _price(risk))
+        # On NSE, charges grow with qty; shrink until loss + charges fits.
+        if MARKET != "us" and ml_shares > 0:
+            while ml_shares > 0:
+                trial_loss = round(ml_shares * risk_c / 100.0, 2)
+                trial_charges = MKT.trade_charges(MARKET, ml_shares, ref, stop, c)["charges"]
+                if round(trial_loss + trial_charges, 2) <= max_loss + 0.005:
+                    break
+                ml_shares -= 1
+            if ml_shares > 0:
+                ml_how = ("%d x %s + %s charges = %s within %s max loss"
+                          % (ml_shares, _price(risk), money(trial_charges),
+                             money(round(trial_loss + trial_charges, 2)), money(max_loss)))
+        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": ml_shares,
+                       "how": ml_how})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
@@ -447,12 +467,24 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         l["binds"] = l["name"] == bound[0]
     cost = round(qty * ref, 2)
     loss = round(qty * risk_c / 100.0, 2)
+
+    # NSE transaction charges (statutory + estimated slippage)
+    charges_info = MKT.trade_charges(MARKET, qty, ref, stop, c)
+    charges = charges_info["charges"]
+    loss_with_charges = round(loss + charges, 2)
+
     refusal = None
     if qty == 0:
         if bound[0] == "max loss":
-            refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
-                       "No order. Skip this trade, or plan a closer stop with trader-exit."
-                       % (money(risk), _price(ref), _price(stop), money(max_loss)))
+            if MARKET != "us" and charges > 0:
+                one_charges = MKT.trade_charges(MARKET, 1, ref, stop, c)["charges"]
+                refusal = ("one share risks %s plus %s charges = %s, more than your %s max loss per trade. "
+                           "No order. Skip this trade, or plan a closer stop with trader-exit."
+                           % (money(risk), money(one_charges), money(round(risk + one_charges, 2)), money(max_loss)))
+            else:
+                refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
+                           "No order. Skip this trade, or plan a closer stop with trader-exit."
+                           % (money(risk), _price(ref), _price(stop), money(max_loss)))
         else:
             refusal = ("one share of %s costs %s, more than your %s limit (%s). No order."
                        % (sym, money(ref), bound[0], limits[[l["name"] for l in limits].index(bound[0])]["how"]))
@@ -463,7 +495,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     elif cost < float(c.get("min_order_usd") or 0) - 0.005:
         refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
                    % (qty, "" if qty == 1 else "s", sym, money(cost), money(c["min_order_usd"])))
-    return {
+    result = {
         "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
         "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
         "entry": ref, "entry_from": ref_from, "stop": stop, "target": target,
@@ -471,9 +503,15 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "stop_label": plan.get("stop_label", ""), "target_label": plan.get("target_label", ""),
         "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
-        "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
+        "cost": cost, "max_loss": loss,
+        "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
     }
+    if MARKET != "us":
+        result["charges"] = charges
+        result["max_loss_with_charges"] = loss_with_charges
+        result["charges_breakdown"] = charges_info.get("breakdown")
+    return result
 
 
 def bracket_order(s):
@@ -490,14 +528,19 @@ def bracket_order(s):
                                              "position cap": "position cap", "max order": "max order",
                                              "cash": "cash after the buffer"}[s["bound_by"]],
               s["qty"], _price(s["risk_per_share"]), money(s["max_loss"])))
+    plan_dict = {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
+                 "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"],
+                 "setup": s["setup"], "entry_time": s["entry_time"], "flat_by": s["flat_by"]}
+    if "charges" in s:
+        plan_dict["charges"] = s["charges"]
+        plan_dict["max_loss_with_charges"] = s["max_loss_with_charges"]
+        plan_dict["charges_breakdown"] = s["charges_breakdown"]
     o.update({
         "order_class": "bracket",
         "take_profit_limit_price": _price(s["target"]),
         "stop_loss_stop_price": _price(s["stop"]),
         "why": why,
-        "plan": {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
-                 "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
-                 "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
+        "plan": plan_dict,
     })
     return o
 
@@ -530,6 +573,9 @@ def plan_report(s, order, notes=()):
     lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
                  % (s["qty"], s["symbol"], money(s["cost"]), _price(s["entry"]), s["qty"],
                     _price(s["risk_per_share"]), money(s["max_loss"])))
+    if s.get("charges", 0) > 0:
+        lines.append("Estimated charges (statutory + slippage): %s. Total risk with charges: %s."
+                     % (money(s["charges"]), money(s["max_loss_with_charges"])))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
     lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
